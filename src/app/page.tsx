@@ -24,6 +24,27 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import Image from "next/image";
+import type { Abi, Address } from "viem";
+
+// viem client tipleri (istersen kullanabilirsin)
+type Public = ReturnType<typeof createPublicClient>;
+type Wallet = ReturnType<typeof createWalletClient>;
+
+// Sadece kullandığımız read fonksiyonlarını içeren minimal arayüzler
+type AirdropContract = {
+  read: {
+    TOKEN: () => Promise<Address>;
+    hasClaimed: (args: [Address]) => Promise<boolean>;
+  };
+};
+
+type ERC20Token = {
+  read: {
+    decimals: () => Promise<number>;
+    symbol: () => Promise<string>;
+    balanceOf: (args: [Address]) => Promise<bigint>;
+  };
+};
 
 // ===== CONFIG (adjust if needed) =====
 const AIRDROP_ADDRESS = "0x87bAa1694381aE3eCaE2660d97fe60404080Eb64"; // Official Linea airdrop
@@ -217,9 +238,19 @@ export default function App() {
   // Per-wallet operations (can be used by workers or manual buttons)
   async function readTokenAndBalances(publicClient:any, walletClient:any, accountAddr:`0x${string}`, row:Row) {
     await rateGate();
-    const airdrop = getContract({ address: AIRDROP_ADDRESS, abi: AIRDROP_ABI, client: { public: publicClient, wallet: walletClient } });
-    const tokenAddr: `0x${string}` = await airdrop.read.TOKEN();
-    const token = getContract({ address: tokenAddr, abi: ERC20_ABI, client: { public: publicClient, wallet: walletClient } });
+    const airdrop = getContract({
+      address: AIRDROP_ADDRESS as Address,
+      abi: AIRDROP_ABI as Abi,
+      client: { public: publicClient, wallet: walletClient },
+    }) as unknown as AirdropContract;
+    
+    const tokenAddr = await airdrop.read.TOKEN();
+    
+    const token = getContract({
+      address: tokenAddr as Address,
+      abi: ERC20_ABI as Abi,
+      client: { public: publicClient, wallet: walletClient },
+    }) as unknown as ERC20Token;
 
     await rateGate();
     const [decimals, symbol] = await Promise.all([
@@ -238,13 +269,16 @@ export default function App() {
   }
 
   async function attemptClaim(row:Row, publicClient:any, walletClient:any, accountAddr:`0x${string}`) {
-    const airdrop = getContract({ address: AIRDROP_ADDRESS, abi: AIRDROP_ABI, client: { public: publicClient, wallet: walletClient } });
-
+    const airdrop = getContract({
+      address: AIRDROP_ADDRESS as Address,
+      abi: AIRDROP_ABI as Abi,
+      client: { public: publicClient, wallet: walletClient },
+    }) as unknown as AirdropContract;
     // quick check
     try {
       setPhase(row.address, 'checking', 'checking', 'Checking claim status…');
       await rateGate();
-      const already = await airdrop.read.hasClaimed([accountAddr]);
+      const already = await airdrop.read.hasClaimed([accountAddr as Address]);
       if (already) { setPhase(row.address, 'done', 'done', 'Already claimed'); return { already: true }; }
     } catch (e:any) {
       const { phase, message } = classifyError(e);
@@ -446,8 +480,11 @@ export default function App() {
         symbol = info.symbol;
         setG(prev => ({ ...prev, tokenSymbol: symbol, tokenDecimals: decimals }));
       } else {
-        token = getContract({ address: tokenAddr, abi: ERC20_ABI, client: { public: publicClient, wallet: walletClient } });
-      }
+        token = getContract({
+          address: tokenAddr as Address,
+          abi: ERC20_ABI as Abi,
+          client: { public: publicClient, wallet: walletClient },
+        }) as unknown as ERC20Token;      }
 
       const res = await attemptClaim(row, publicClient, walletClient, account.address);
       if (res.error && !/already claimed/i.test(res.error)) return;
@@ -487,8 +524,11 @@ export default function App() {
         symbol = info.symbol;
         setG(prev => ({ ...prev, tokenSymbol: symbol, tokenDecimals: decimals }));
       } else {
-        token = getContract({ address: tokenAddr, abi: ERC20_ABI, client: { public: publicClient, wallet: walletClient } });
-      }
+        token = getContract({
+          address: tokenAddr as Address,
+          abi: ERC20_ABI as Abi,
+          client: { public: publicClient, wallet: walletClient },
+        }) as unknown as ERC20Token;      }
 
       await sendAll(row, publicClient, walletClient, token, tokenAddr!, decimals, symbol, dest);
       // global sent update
@@ -612,7 +652,7 @@ export default function App() {
         {/* Global aggregates */}
         <div className="grid md:grid-cols-3 gap-4">
           <div className="bg-[#0f1a2b]/80 border border-blue-900 rounded-2xl p-4 shadow-lg">
-            <div className="text-xs uppercase text-blue-200/70">Total Token</div>
+            <div className="text-xs uppercase text-blue-200/70">Token Name</div>
             <div className="text-lg font-semibold">{g.tokenSymbol ?? '—'}</div>
           </div>
           <div className="bg-[#0f1a2b]/80 border border-blue-900 rounded-2xl p-4 shadow-lg">
