@@ -12,6 +12,7 @@
 // - Global aggregates (claimed & sent) + per-wallet counts and token symbol
 // - Export logs as CSV
 // - Manual Claim / Manual Deposit (independent of concurrency/pause)
+// - Custom EIP-1559 fees (default ~10x network suggestion, user-configurable)
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -20,7 +21,8 @@ import {
   getContract,
   http,
   defineChain,
-  formatUnits
+  formatUnits,
+  parseUnits,          // Gwei → wei
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import Image from "next/image";
@@ -144,6 +146,13 @@ export default function App() {
   const [concurrency, setConcurrency] = useState<number>(typeof window!=="undefined" ? Number(localStorage.getItem('concurrency') || '3') : 3);
   const [rpcIntervalMs, setRpcIntervalMs] = useState<number>(typeof window!=="undefined" ? Number(localStorage.getItem('rpcIntervalMs') || '250') : 250);
 
+  // Custom gas (EIP-1559)
+  const [useCustomGas, setUseCustomGas] = useState<boolean>(
+    typeof window !== "undefined" ? localStorage.getItem("useCustomGas") === "1" : false
+  );
+  const [maxFeeGwei, setMaxFeeGwei] = useState<string>(typeof window !== "undefined" ? (localStorage.getItem("maxFeeGwei") || "") : "");
+  const [priorityGwei, setPriorityGwei] = useState<string>(typeof window !== "undefined" ? (localStorage.getItem("priorityGwei") || "") : "");
+
   // Runtime
   const [rows, setRows] = useState<Row[]>([]);
   const [isRunning, setIsRunning] = useState(false);
@@ -165,6 +174,11 @@ export default function App() {
   useEffect(()=> localStorage.setItem('privateKeysRaw', privateKeysRaw), [privateKeysRaw]);
   useEffect(()=> localStorage.setItem('concurrency', String(concurrency)), [concurrency]);
   useEffect(()=> localStorage.setItem('rpcIntervalMs', String(rpcIntervalMs)), [rpcIntervalMs]);
+
+  // Persist custom gas
+  useEffect(()=> localStorage.setItem('useCustomGas', useCustomGas ? "1" : "0"), [useCustomGas]);
+  useEffect(()=> localStorage.setItem('maxFeeGwei', String(maxFeeGwei||"")), [maxFeeGwei]);
+  useEffect(()=> localStorage.setItem('priorityGwei', String(priorityGwei||"")), [priorityGwei]);
 
   // Parse inputs
   const parsed = useMemo(() => {
@@ -235,17 +249,28 @@ export default function App() {
   // Central rate-limited call wrapper
   const rateGate = async () => { if (rpcIntervalMs > 0) await sleep(rpcIntervalMs); };
 
+  // Gas overrides helper
+  function gasOverrides() {
+    if (!useCustomGas) return {};
+    const mfOk = maxFeeGwei && !isNaN(Number(maxFeeGwei));
+    const mpOk = priorityGwei && !isNaN(Number(priorityGwei));
+    const o: Record<string, bigint> = {};
+    if (mfOk) o.maxFeePerGas = parseUnits(maxFeeGwei as `${number}`, 9);      // Gwei → wei
+    if (mpOk) o.maxPriorityFeePerGas = parseUnits(priorityGwei as `${number}`, 9);
+    return o;
+  }
+
   // Per-wallet operations (can be used by workers or manual buttons)
-  async function readTokenAndBalances(publicClient:any, walletClient:any, accountAddr:`0x${string}`, row:Row) {
+  async function readTokenAndBalances(publicClient:Public, walletClient:Wallet, accountAddr:`0x${string}`, row:Row) {
     await rateGate();
     const airdrop = getContract({
       address: AIRDROP_ADDRESS as Address,
       abi: AIRDROP_ABI as Abi,
       client: { public: publicClient, wallet: walletClient },
     }) as unknown as AirdropContract;
-    
+
     const tokenAddr = await airdrop.read.TOKEN();
-    
+
     const token = getContract({
       address: tokenAddr as Address,
       abi: ERC20_ABI as Abi,
@@ -268,12 +293,13 @@ export default function App() {
     return { tokenAddr, decimals, symbol: String(symbol), beforeBal, token };
   }
 
-  async function attemptClaim(row:Row, publicClient:any, walletClient:any, accountAddr:`0x${string}`) {
+  async function attemptClaim(row:Row, publicClient:Public, walletClient:Wallet, accountAddr:`0x${string}`) {
     const airdrop = getContract({
       address: AIRDROP_ADDRESS as Address,
       abi: AIRDROP_ABI as Abi,
       client: { public: publicClient, wallet: walletClient },
     }) as unknown as AirdropContract;
+
     // quick check
     try {
       setPhase(row.address, 'checking', 'checking', 'Checking claim status…');
@@ -294,9 +320,22 @@ export default function App() {
         setRows(prev => prev.map(r => r.address===row.address ? ({...r, claimTries: r.claimTries+1}) : r));
         setPhase(row.address, 'claiming', 'claiming', `claim() attempt ${attempt}…`);
         await rateGate();
-        const hash = await walletClient.writeContract({ address: AIRDROP_ADDRESS, abi: AIRDROP_ABI, functionName: 'claim', args: [] });
-        await publicClient.waitForTransactionReceipt({ hash });
+        const hash = await walletClient.writeContract({
+          address: AIRDROP_ADDRESS,
+          abi: AIRDROP_ABI,
+          functionName: 'claim',
+          args: [],
+          ...gasOverrides(),                    // custom fee (opsiyonel)
+        });
+        const rcpt = await publicClient.waitForTransactionReceipt({ hash });
         markTx(row.address, hash);
+
+        // GAS log (opsiyonel güzel görünüm)
+        const gasUsed = rcpt.gasUsed;
+        const effGasPrice = rcpt.effectiveGasPrice;
+        const costWei = gasUsed * effGasPrice;
+        setPhase(row.address, 'claiming', 'post', `Claim ok | gasUsed=${gasUsed} cost=${formatUnits(costWei, 18)} ETH`);
+
         return { already:false, hash };
       } catch (e:any) {
         const { phase, message } = classifyError(e);
@@ -309,7 +348,7 @@ export default function App() {
     return { already:false, error:'unreachable' };
   }
 
-  async function sendAll(row:Row, publicClient:any, walletClient:any, token:any, tokenAddr:`0x${string}`, decimals:number, symbol:string, dest:string) {
+  async function sendAll(row:Row, publicClient:Public, walletClient:Wallet, token:any, tokenAddr:`0x${string}`, decimals:number, symbol:string, dest:string) {
     if (!dest) { setPhase(row.address, 'fail', 'fail', 'No CEX deposit address'); return; }
 
     await rateGate();
@@ -322,11 +361,23 @@ export default function App() {
         setRows(prev => prev.map(r => r.address===row.address ? ({...r, sendTries: r.sendTries+1}) : r));
         setPhase(row.address, 'sending', 'sending', `Sending ${formatUnits(bal, decimals)} ${symbol} → ${shortAddr(dest)} (try ${attempt})`);
         await rateGate();
-        const h = await walletClient.writeContract({ address: tokenAddr, abi: ERC20_ABI, functionName: 'transfer', args: [dest, bal] });
-        await publicClient.waitForTransactionReceipt({ hash: h });
+        const h = await walletClient.writeContract({
+          address: tokenAddr,
+          abi: ERC20_ABI,
+          functionName: 'transfer',
+          args: [dest, bal],
+          ...gasOverrides(),                    // custom fee (opsiyonel)
+        });
+        const rcpt = await publicClient.waitForTransactionReceipt({ hash: h });
         markTx(row.address, h);
         setRows(prev => prev.map(r => r.address===row.address ? ({...r, sentAmount: (r.sentAmount ?? 0n) + bal }) : r));
-        setPhase(row.address, 'done', 'done', 'Transfer complete ✅');
+
+        // GAS log
+        const gasUsed = rcpt.gasUsed;
+        const effGasPrice = rcpt.effectiveGasPrice;
+        const costWei = gasUsed * effGasPrice;
+        setPhase(row.address, 'done', 'done', `Transfer complete ✅ | gasUsed=${gasUsed} cost=${formatUnits(costWei, 18)} ETH`);
+
         return;
       } catch (e:any) {
         const { phase, message } = classifyError(e);
@@ -337,7 +388,7 @@ export default function App() {
     }
   }
 
-  async function processWallet(row:Row, publicClient:any, dest:string) {
+  async function processWallet(row:Row, publicClient:Public, dest:string) {
     const account = privateKeyToAccount(row.pk as `0x${string}`);
     const walletClient = createWalletClient({ account, chain: linea, transport: http(effectiveRpc) });
 
@@ -389,6 +440,24 @@ export default function App() {
     });
   }
 
+  // On mount: try fill default custom gas with ~10x suggestion (fallback 0.53809001 Gwei → senin örneğin 10x)
+  useEffect(() => {
+    (async () => {
+      try {
+        const pc = createPublicClient({ chain: linea, transport: http(effectiveRpc) });
+        const fees = await pc.estimateFeesPerGas(); // { maxFeePerGas, maxPriorityFeePerGas }
+        const tenXMaxFee = Number(fees.maxFeePerGas) * 10 / 1e9;        // to Gwei
+        const tenXPrio   = Number(fees.maxPriorityFeePerGas) * 10 / 1e9; // to Gwei
+        if (!maxFeeGwei) setMaxFeeGwei(tenXMaxFee.toString());
+        if (!priorityGwei) setPriorityGwei(tenXPrio.toString());
+      } catch {
+        if (!maxFeeGwei) setMaxFeeGwei("0.53809001");
+        if (!priorityGwei) setPriorityGwei("0.53809001");
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Start run with worker pool
   async function startRun() {
     if (!parsed.deposits.length) { alert('Enter at least one CEX deposit address (0x...).'); return; }
@@ -406,12 +475,11 @@ export default function App() {
 
     let index = 0;
     const maxWorkers = Math.max(1, Math.min(20, Number(concurrency)||1));
-    const snapshotRows = () => rows; // closure reads state, fine for simple queue
+    const snapshotRows = () => rows; // closure reads state, simple queue ok
     const nextTask = () => {
       const rs = snapshotRows();
       while (index < rs.length) {
         const r = rs[index++];
-        // skip completed/failed
         if (!r) break;
         if (['done'].includes(r.status)) continue;
         return r;
@@ -625,7 +693,7 @@ export default function App() {
               </svg>
               <span className="text-sm font-medium">@StealthyPepe</span>
             </a>
-  
+
             <button onClick={exportCSV} className="text-sm bg-blue-600 hover:bg-blue-500 text-white rounded-xl px-3 py-1.5">
               Export CSV
             </button>
@@ -648,7 +716,7 @@ export default function App() {
             </button>
           </div>
         </header>
-  
+
         {/* Global aggregates */}
         <div className="grid md:grid-cols-3 gap-4">
           <div className="bg-[#0f1a2b]/80 border border-blue-900 rounded-2xl p-4 shadow-lg">
@@ -668,7 +736,7 @@ export default function App() {
             </div>
           </div>
         </div>
-  
+
         {/* Controls */}
         <div className="bg-[#0f1a2b]/80 border border-blue-900 rounded-2xl p-5 shadow-lg">
           <div className="grid lg:grid-cols-3 gap-5">
@@ -682,7 +750,7 @@ export default function App() {
               />
               <p className="text-xs text-blue-200/70 mt-1">Leave blank to use Linea public RPC.</p>
             </div>
-  
+
             <div>
               <label className="block text-sm text-blue-200/80">Concurrency</label>
               <input
@@ -695,7 +763,7 @@ export default function App() {
               />
               <p className="text-xs text-blue-200/70 mt-1">Parallel wallets processed at once.</p>
             </div>
-  
+
             <div>
               <label className="block text-sm text-blue-200/80">RPC interval (ms)</label>
               <input
@@ -708,7 +776,47 @@ export default function App() {
               <p className="text-xs text-blue-200/70 mt-1">Rate-limit between RPC calls (helps avoid 429/timeout).</p>
             </div>
           </div>
-  
+
+          {/* Custom Gas */}
+          <div className="mt-5 border-t border-blue-900/60 pt-5">
+            <label className="flex items-center gap-2 text-sm text-blue-200/80">
+              <input
+                type="checkbox"
+                checked={useCustomGas}
+                onChange={(e)=> setUseCustomGas(e.target.checked)}
+                className="accent-blue-500"
+              />
+              Use custom gas (EIP-1559)
+            </label>
+
+            <div className="grid md:grid-cols-2 gap-4 mt-3">
+              <div>
+                <label className="block text-xs text-blue-200/70">Max Fee (Gwei)</label>
+                <input
+                  value={maxFeeGwei}
+                  onChange={(e)=> setMaxFeeGwei(e.target.value)}
+                  placeholder="e.g. 0.53809001"
+                  className="w-full bg-blue-950/40 border border-blue-800 rounded-xl px-3 py-2 text-blue-100 placeholder:text-blue-300/50 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
+                  disabled={!useCustomGas}
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-blue-200/70">Priority Fee (Gwei)</label>
+                <input
+                  value={priorityGwei}
+                  onChange={(e)=> setPriorityGwei(e.target.value)}
+                  placeholder="e.g. 0.53809001"
+                  className="w-full bg-blue-950/40 border border-blue-800 rounded-xl px-3 py-2 text-blue-100 placeholder:text-blue-300/50 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
+                  disabled={!useCustomGas}
+                />
+              </div>
+            </div>
+
+            <p className="text-xs text-blue-200/60 mt-2">
+              Default values are set to ~10× the current network suggestion. Leave unchecked to use automatic fees.
+            </p>
+          </div>
+
           <div className="grid lg:grid-cols-2 gap-5 mt-5">
             <div>
               <label className="block text-sm text-blue-200/80">CEX Deposit Address(es)</label>
@@ -732,7 +840,7 @@ export default function App() {
               />
             </div>
           </div>
-  
+
           <div className="text-sm text-blue-200/80 mt-4 flex flex-wrap items-center gap-4">
             <div>Starts (UTC): <b>2025-09-10 15:00:00</b></div>
             <div>Countdown: <b>{msToHMS(countdown)}</b></div>
@@ -741,7 +849,7 @@ export default function App() {
             </div>
           </div>
         </div>
-  
+
         {/* Progress */}
         <div className="bg-[#0f1a2b]/80 border border-blue-900 rounded-2xl p-5 shadow-lg">
           <div className="flex items-center justify-between mb-3">
@@ -752,7 +860,7 @@ export default function App() {
               <span className="flex items-center gap-1 text-rose-300"><IconFail/> Failed</span>
             </div>
           </div>
-  
+
           {/* Overall progress */}
           <div className="mb-4">
             <div className="flex justify-between text-xs text-blue-200/70 mb-1">
@@ -771,7 +879,7 @@ export default function App() {
               <span className="text-rose-300">{failed} Failed</span>
             </div>
           </div>
-  
+
           {/* Wallet list */}
           <div className="max-h-[520px] overflow-auto divide-y divide-blue-900/70">
             {rows.length === 0 && (
@@ -781,7 +889,7 @@ export default function App() {
                 <p className="text-xs">Add private keys to get started</p>
               </div>
             )}
-  
+
             {rows.map((r, i) => (
               <div key={r.address + "-" + i} className="py-3 flex items-start gap-3">
                 <div className="mt-1">{statusIcon(r.status)}</div>
@@ -793,7 +901,7 @@ export default function App() {
                       <Badge phase={r.phase}>{r.phase}</Badge>
                     </div>
                   </div>
-  
+
                   {/* extra per-wallet stats line */}
                   <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-blue-200/80 mt-1">
                     <span>Claim tries: <b>{r.claimTries}</b></span>
@@ -806,9 +914,9 @@ export default function App() {
                       <span>Sent: <b>{formatUnits(r.sentAmount!, g.tokenDecimals!)} {g.tokenSymbol}</b></span>
                     )}
                   </div>
-  
+
                   <div className="text-xs text-blue-200/70 mt-0.5">{r.note || '—'}</div>
-  
+
                   {/* Actions */}
                   <div className="flex flex-wrap gap-2 mt-2">
                     <button
@@ -836,7 +944,7 @@ export default function App() {
                       Retry Deposit
                     </button>
                   </div>
-  
+
                   {/* TXs */}
                   {r.txs?.length > 0 && (
                     <div className="text-xs text-blue-200/80 mt-1 space-y-0.5">
@@ -860,7 +968,7 @@ export default function App() {
             ))}
           </div>
         </div>
-  
+
         {/* Footer */}
         <div className="text-xs text-blue-200/70">
           <p>
@@ -879,5 +987,4 @@ export default function App() {
       </div>
     </div>
   );
-  
 }
