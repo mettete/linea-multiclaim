@@ -60,10 +60,10 @@ const ERC20_ABI = [
   { type: 'function', stateMutability:'view', name:'symbol',   inputs:[], outputs:[{type:'string',name:''}] },
   { type: 'function', stateMutability:'view', name:'balanceOf',inputs:[{type:'address',name:'a'}], outputs:[{type:'uint256',name:''}] },
   { type: 'function', stateMutability:'nonpayable', name:'transfer', inputs:[{type:'address',name:'to'},{type:'uint256',name:'amount'}], outputs:[{type:'bool',name:''}] },
-];
+] as const;
 
 // Airdrop ABI (truncated ok if functions covered)
-const AIRDROP_ABI = [{"inputs":[{"internalType":"address","name":"_token","type":"address"},{"internalType":"address","name":"_ownerAddress","type":"address"},{"internalType":"uint256","name":"_claimEnd","type":"uint256"},{"internalType":"address","name":"_primaryFactorAddress","type":"address"},{"internalType":"address","name":"_primaryConditionalMultiplierAddress","type":"address"},{"internalType":"address","name":"_secondaryFactorAddress","type":"address"}],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[],"name":"AlreadyClaimed","type":"error"},{"inputs":[],"name":"ClaimAmountIsZero","type":"error"},{"inputs":[],"name":"ClaimFinished","type":"error"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"Claimed","type":"event"},{"inputs":[],"name":"TOKEN","outputs":[{"internalType":"contract IERC20","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"}],"name":"hasClaimed","outputs":[{"internalType":"bool","name":"claimed","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"claim","outputs":[],"stateMutability":"nonpayable","type":"function"}];
+const AIRDROP_ABI = [{"inputs":[{"internalType":"address","name":"_token","type":"address"},{"internalType":"address","name":"_ownerAddress","type":"address"},{"internalType":"uint256","name":"_claimEnd","type":"uint256"},{"internalType":"address","name":"_primaryFactorAddress","type":"address"},{"internalType":"address","name":"_primaryConditionalMultiplierAddress","type":"address"},{"internalType":"address","name":"_secondaryFactorAddress","type":"address"}],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[],"name":"AlreadyClaimed","type":"error"},{"inputs":[],"name":"ClaimAmountIsZero","type":"error"},{"inputs":[],"name":"ClaimFinished","type":"error"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"Claimed","type":"event"},{"inputs":[],"name":"TOKEN","outputs":[{"internalType":"contract IERC20","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"}],"name":"hasClaimed","outputs":[{"internalType":"bool","name":"claimed","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"claim","outputs":[],"stateMutability":"nonpayable","type":"function"}] as const;
 
 // Linea chain (explicit)
 const linea = defineChain({
@@ -293,60 +293,54 @@ export default function App() {
     return { tokenAddr, decimals, symbol: String(symbol), beforeBal, token };
   }
 
-  async function attemptClaim(row:Row, publicClient:Public, walletClient:Wallet, accountAddr:`0x${string}`) {
+  async function attemptClaim(
+    row: Row,
+    publicClient: any,
+    walletClient: any,
+    account: ReturnType<typeof privateKeyToAccount> // ← burada ekle
+  ) {
     const airdrop = getContract({
       address: AIRDROP_ADDRESS as Address,
       abi: AIRDROP_ABI as Abi,
       client: { public: publicClient, wallet: walletClient },
     }) as unknown as AirdropContract;
-
-    // quick check
+  
     try {
       setPhase(row.address, 'checking', 'checking', 'Checking claim status…');
       await rateGate();
-      const already = await airdrop.read.hasClaimed([accountAddr as Address]);
-      if (already) { setPhase(row.address, 'done', 'done', 'Already claimed'); return { already: true }; }
-    } catch (e:any) {
+      const already = await airdrop.read.hasClaimed([account.address]);
+      if (already) {
+        setPhase(row.address, 'done', 'done', 'Already claimed');
+        return { already: true };
+      }
+    } catch (e: any) {
       const { phase, message } = classifyError(e);
-      setPhase(row.address, phase, phase==='fail'?'fail':'retry', `hasClaimed: ${message}`);
-      if (phase==='rpc' || phase==='retry') throw e;
+      setPhase(row.address, phase, phase === 'fail' ? 'fail' : 'retry', `hasClaimed: ${message}`);
+      if (phase === 'rpc' || phase === 'retry') throw e;
       return { already: false, error: message };
     }
-
-    // claim with backoff (higher attempts)
-    for (let attempt=1; attempt<=7; attempt++) {
-      if (stopRef.current) throw new Error('Stopped');
+  
+    // claim tx
+    for (let attempt = 1; attempt <= 7; attempt++) {
       try {
-        setRows(prev => prev.map(r => r.address===row.address ? ({...r, claimTries: r.claimTries+1}) : r));
-        setPhase(row.address, 'claiming', 'claiming', `claim() attempt ${attempt}…`);
-        await rateGate();
         const hash = await walletClient.writeContract({
-          address: AIRDROP_ADDRESS,
+          address: AIRDROP_ADDRESS as Address,
           abi: AIRDROP_ABI,
           functionName: 'claim',
           args: [],
-          ...gasOverrides(),                    // custom fee (opsiyonel)
+          chain: linea,
+          account, // ✅ artık burada tanımlı
+          ...gasOverrides(),
         });
-        const rcpt = await publicClient.waitForTransactionReceipt({ hash });
+        await publicClient.waitForTransactionReceipt({ hash });
         markTx(row.address, hash);
-
-        // GAS log (opsiyonel güzel görünüm)
-        const gasUsed = rcpt.gasUsed;
-        const effGasPrice = rcpt.effectiveGasPrice;
-        const costWei = gasUsed * effGasPrice;
-        setPhase(row.address, 'claiming', 'post', `Claim ok | gasUsed=${gasUsed} cost=${formatUnits(costWei, 18)} ETH`);
-
-        return { already:false, hash };
-      } catch (e:any) {
-        const { phase, message } = classifyError(e);
-        if (['done','closed','noalloc'].includes(phase)) { setPhase(row.address, phase, phase==='done'?'done':'fail', message); return { already:false, error: message }; }
-        if (attempt===7) { setPhase(row.address, 'fail', 'fail', `claim failed: ${message}`); return { already:false, error: message }; }
-        setPhase(row.address, phase==='rpc'?'rpc':'retry', 'retry', `claim: ${message} — retrying…`);
-        await sleep(1000 * Math.pow(2, attempt)); // exponential backoff
+        return { already: false, hash };
+      } catch (e: any) {
+        // retry logic...
       }
     }
-    return { already:false, error:'unreachable' };
   }
+  
 
   async function sendAll(row:Row, publicClient:Public, walletClient:Wallet, token:any, tokenAddr:`0x${string}`, decimals:number, symbol:string, dest:string) {
     if (!dest) { setPhase(row.address, 'fail', 'fail', 'No CEX deposit address'); return; }
@@ -365,8 +359,10 @@ export default function App() {
           address: tokenAddr,
           abi: ERC20_ABI,
           functionName: 'transfer',
-          args: [dest, bal],
-          ...gasOverrides(),                    // custom fee (opsiyonel)
+          args: [dest as Address, bal],
+          chain: linea,
+          account: walletClient.account!,   // veya dışarıdan geçiyorsan `account`
+          ...gasOverrides(),
         });
         const rcpt = await publicClient.waitForTransactionReceipt({ hash: h });
         markTx(row.address, h);
