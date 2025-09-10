@@ -26,7 +26,7 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import Image from "next/image";
-import type { Abi, Address } from "viem";
+import type { Abi, Address, Account } from "viem";
 
 // viem client tipleri (istersen kullanabilirsin)
 type Public = ReturnType<typeof createPublicClient>;
@@ -297,7 +297,7 @@ export default function App() {
     row: Row,
     publicClient: any,
     walletClient: any,
-    account: ReturnType<typeof privateKeyToAccount> // ← burada ekle
+    account: Account               // ✅ Address değil Account
   ) {
     const airdrop = getContract({
       address: AIRDROP_ADDRESS as Address,
@@ -329,7 +329,7 @@ export default function App() {
           functionName: 'claim',
           args: [],
           chain: linea,
-          account, // ✅ artık burada tanımlı
+          account,                      // ✅ Account objesini geçir
           ...gasOverrides(),
         });
         await publicClient.waitForTransactionReceipt({ hash });
@@ -342,7 +342,7 @@ export default function App() {
   }
   
 
-  async function sendAll(row:Row, publicClient:Public, walletClient:Wallet, token:any, tokenAddr:`0x${string}`, decimals:number, symbol:string, dest:string) {
+  async function sendAll(row:Row, publicClient:Public, walletClient:Wallet, token:any, tokenAddr:`0x${string}`, decimals:number, symbol:string, dest:string,account: Account) {
     if (!dest) { setPhase(row.address, 'fail', 'fail', 'No CEX deposit address'); return; }
 
     await rateGate();
@@ -361,7 +361,7 @@ export default function App() {
           functionName: 'transfer',
           args: [dest as Address, bal],
           chain: linea,
-          account: walletClient.account!,   // veya dışarıdan geçiyorsan `account`
+          account,                      // ✅ Account objesi
           ...gasOverrides(),
         });
         const rcpt = await publicClient.waitForTransactionReceipt({ hash: h });
@@ -385,7 +385,7 @@ export default function App() {
   }
 
   async function processWallet(row:Row, publicClient:Public, dest:string) {
-    const account = privateKeyToAccount(row.pk as `0x${string}`);
+    const account = privateKeyToAccount(row.pk as `0x${string}`) as Account;
     const walletClient = createWalletClient({ account, chain: linea, transport: http(effectiveRpc) });
 
     // Read token and BEFORE balance (safe to call even pre-claim)
@@ -409,7 +409,7 @@ export default function App() {
     }
 
     // Claim
-    const claimRes = await attemptClaim(row, publicClient, walletClient, account.address);
+    const claimRes = await attemptClaim(row, publicClient, walletClient, account);
     if (claimRes.error && !/already claimed/i.test(claimRes.error)) return;
 
     // AFTER balance (to compute claimed delta)
@@ -427,7 +427,7 @@ export default function App() {
     }
 
     // Send all to CEX
-    await sendAll(row, publicClient, walletClient, token, tokenAddr!, decimals, symbol, dest);
+    await sendAll(row, publicClient, walletClient, token, tokenAddr!, decimals, symbol, dest, account);
     // Update global totalSent
     setG(prev => {
       const rowNow = rows.find(r => r.address === row.address);
@@ -526,7 +526,7 @@ export default function App() {
   async function manualClaim(addr:string) {
     const row = rows.find(r=>r.address===addr);
     if (!row) return;
-    const account = privateKeyToAccount(row.pk as `0x${string}`);
+    const account = privateKeyToAccount(row.pk as `0x${string}`) as Account;
     const publicClient = createPublicClient({ chain: linea, transport: http(effectiveRpc) });
     const walletClient = createWalletClient({ account, chain: linea, transport: http(effectiveRpc) });
 
@@ -550,8 +550,8 @@ export default function App() {
           client: { public: publicClient, wallet: walletClient },
         }) as unknown as ERC20Token;      }
 
-      const res = await attemptClaim(row, publicClient, walletClient, account.address);
-      if (res.error && !/already claimed/i.test(res.error)) return;
+        const res = await attemptClaim(row, publicClient, walletClient, account);
+        if (res.error && !/already claimed/i.test(res.error)) return;
 
       await rateGate();
       const afterBal: bigint = await token.read.balanceOf([account.address]);
@@ -569,7 +569,7 @@ export default function App() {
     const row = rows.find(r=>r.address===addr);
     if (!row) return;
     const dest = row.dest;
-    const account = privateKeyToAccount(row.pk as `0x${string}`);
+    const account = privateKeyToAccount(row.pk as `0x${string}`) as Account;
     const publicClient = createPublicClient({ chain: linea, transport: http(effectiveRpc) });
     const walletClient = createWalletClient({ account, chain: linea, transport: http(effectiveRpc) });
 
@@ -594,8 +594,8 @@ export default function App() {
           client: { public: publicClient, wallet: walletClient },
         }) as unknown as ERC20Token;      }
 
-      await sendAll(row, publicClient, walletClient, token, tokenAddr!, decimals, symbol, dest);
-      // global sent update
+        await sendAll(row, publicClient, walletClient, token, tokenAddr!, decimals, symbol, dest, account);
+        // global sent update
       const freshRow = rows.find(r=>r.address===addr);
       const add = freshRow?.sentAmount ?? 0n;
       setG(prev => ({ ...prev, totalSent: prev.totalSent + add }));
