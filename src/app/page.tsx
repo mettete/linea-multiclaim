@@ -47,7 +47,11 @@ type ERC20Token = {
     balanceOf: (args: [Address]) => Promise<bigint>;
   };
 };
-
+type AttemptResult = {
+  already: boolean;
+  hash?: `0x${string}`;
+  error?: string;
+};
 // ===== CONFIG (adjust if needed) =====
 const AIRDROP_ADDRESS = "0x87bAa1694381aE3eCaE2660d97fe60404080Eb64"; // Official Linea airdrop
 const DEFAULT_RPC = "https://rpc.linea.build";
@@ -297,48 +301,69 @@ export default function App() {
     row: Row,
     publicClient: any,
     walletClient: any,
-    account: Account               // ✅ Address değil Account
-  ) {
+    account: Account
+  ): Promise<AttemptResult> {
     const airdrop = getContract({
       address: AIRDROP_ADDRESS as Address,
-      abi: AIRDROP_ABI as Abi,
+      abi: AIRDROP_ABI,
       client: { public: publicClient, wallet: walletClient },
-    }) as unknown as AirdropContract;
+    });
   
+    // quick check
     try {
       setPhase(row.address, 'checking', 'checking', 'Checking claim status…');
       await rateGate();
-      const already = await airdrop.read.hasClaimed([account.address]);
-      if (already) {
+      const already = await publicClient.readContract({
+        address: AIRDROP_ADDRESS as Address,
+        abi: AIRDROP_ABI,
+        functionName: 'hasClaimed',
+        args: [account.address as Address],
+      });      if (already) {
         setPhase(row.address, 'done', 'done', 'Already claimed');
         return { already: true };
       }
     } catch (e: any) {
       const { phase, message } = classifyError(e);
       setPhase(row.address, phase, phase === 'fail' ? 'fail' : 'retry', `hasClaimed: ${message}`);
-      if (phase === 'rpc' || phase === 'retry') throw e;
+      if (phase === 'rpc' || phase === 'retry') return { already: false, error: message };
       return { already: false, error: message };
     }
   
-    // claim tx
+    // claim with backoff
     for (let attempt = 1; attempt <= 7; attempt++) {
+      if (stopRef.current) return { already: false, error: 'Stopped' };
       try {
+        setRows(prev => prev.map(r => r.address === row.address ? ({ ...r, claimTries: r.claimTries + 1 }) : r));
+        setPhase(row.address, 'claiming', 'claiming', `claim() attempt ${attempt}…`);
+        await rateGate();
         const hash = await walletClient.writeContract({
           address: AIRDROP_ADDRESS as Address,
           abi: AIRDROP_ABI,
           functionName: 'claim',
           args: [],
           chain: linea,
-          account,                      // ✅ Account objesini geçir
+          account,
           ...gasOverrides(),
         });
         await publicClient.waitForTransactionReceipt({ hash });
         markTx(row.address, hash);
         return { already: false, hash };
       } catch (e: any) {
-        // retry logic...
+        const { phase, message } = classifyError(e);
+        if (['done', 'closed', 'noalloc'].includes(phase)) {
+          setPhase(row.address, phase, phase === 'done' ? 'done' : 'fail', message);
+          return { already: false, error: message };
+        }
+        if (attempt === 7) {
+          setPhase(row.address, 'fail', 'fail', `claim failed: ${message}`);
+          return { already: false, error: message };
+        }
+        setPhase(row.address, phase === 'rpc' ? 'rpc' : 'retry', 'retry', `claim: ${message} — retrying…`);
+        await sleep(1000 * Math.pow(2, attempt));
       }
     }
+  
+    return { already: false, error: 'unreachable' };
   }
   
 
